@@ -1,0 +1,17 @@
+Host kaggle
+    HostName limited-borders-popular-values.trycloudflare.com
+    User root
+    ProxyCommand /opt/homebrew/bin/cloudflared access ssh --hostname %h
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+
+
+
+    for continue use gui
+    LocalForward 11434 localhost:11434
+
+    or
+
+    ssh -L 11434:localhost:11434 kaggle

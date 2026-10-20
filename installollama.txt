@@ -1,0 +1,10 @@
+!apt-get update && apt-get install -y zstd
+!curl -fsSL https://ollama.com/install.sh | sh
+
+
+
+!ollama serve
+
+!ollama run orcarouter/Qwen3.8-27B-Uncensored
+
+

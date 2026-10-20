@@ -1,1 +1,111 @@
-a
+import os, re, time, shlex, secrets, subprocess
+
+# ---------- Settings ----------
+PASSWORD = secrets.token_urlsafe(10)   # or set your own: PASSWORD = "something-strong"
+PUBKEY   = ""                          # optional: paste your ~/.ssh/id_ed25519.pub here for key login
+
+def sh(cmd, inp=None):
+    return subprocess.run(cmd, shell=True, text=True, input=inp,
+                          capture_output=True, executable="/bin/bash")
+
+# 0. Clean up old processes/logs
+sh("pkill -x cloudflared; pkill -x sshd")
+sh("rm -f cloudflared.log")
+
+# 1. Install packages
+print("Installing OpenSSH + tools...")
+r = sh("DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+       "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server wget curl tar")
+if r.returncode != 0:
+    raise RuntimeError("apt-get failed. Is Internet ON in Kaggle notebook settings?\n" + r.stderr)
+
+# 2. Configure sshd with a clean config
+sh("mkdir -p /run/sshd /var/run/sshd /root/.ssh && chmod 700 /root/.ssh")
+sh("rm -f /etc/ssh/sshd_config.d/*.conf")
+sshd_config = """Port 22
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UsePAM no
+AllowTcpForwarding yes
+X11Forwarding no
+ClientAliveInterval 15
+ClientAliveCountMax 3
+Subsystem sftp /usr/lib/openssh/sftp-server
+"""
+with open("/etc/ssh/sshd_config", "w") as f:
+    f.write(sshd_config)
+
+sh("chpasswd", inp=f"root:{PASSWORD}\n")
+if PUBKEY.strip():
+    with open("/root/.ssh/authorized_keys", "a") as f:
+        f.write(PUBKEY.strip() + "\n")
+    sh("chmod 600 /root/.ssh/authorized_keys")
+
+sh("ssh-keygen -A")
+t = sh("/usr/sbin/sshd -t")
+if t.returncode != 0:
+    raise RuntimeError("sshd config error:\n" + t.stderr)
+sh("/usr/sbin/sshd")
+time.sleep(1)
+if sh("pgrep -x sshd").returncode != 0:
+    raise RuntimeError("sshd failed to start")
+
+# 3. Make Kaggle's environment (PATH, CUDA, etc.) available in SSH sessions
+skip = {"HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "SHLVL", "_", "TERM", "HOSTNAME", "LS_COLORS"}
+lines = [f"export {k}={shlex.quote(v)}" for k, v in os.environ.items()
+         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) and k not in skip and not k.startswith(("JPY_", "BASH_FUNC"))]
+with open("/root/.kaggle_env.sh", "w") as f:
+    f.write("\n".join(lines) + "\ncd /kaggle/working 2>/dev/null\n")
+for rc in ("/root/.bashrc", "/root/.profile"):
+    existing = open(rc).read() if os.path.exists(rc) else ""
+    if ".kaggle_env.sh" not in existing:
+        with open(rc, "a") as f:
+            f.write("\n[ -f /root/.kaggle_env.sh ] && source /root/.kaggle_env.sh\n")
+
+# 4. Download cloudflared (if missing)
+if not os.path.exists("cloudflared"):
+    sh("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared && chmod +x cloudflared")
+
+# 5. Start the Cloudflare quick tunnel
+process = subprocess.Popen([
+    "./cloudflared", "tunnel",
+    "--url", "ssh://localhost:22",
+    "--logfile", "cloudflared.log",
+    "--protocol", "http2",
+    "--no-autoupdate",
+], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+print("Waiting for Cloudflare tunnel URL...")
+hostname = None
+for _ in range(90):
+    time.sleep(1)
+    if process.poll() is not None:
+        break
+    if os.path.exists("cloudflared.log"):
+        m = re.search(r"https://([a-zA-Z0-9-]+\.trycloudflare\.com)", open("cloudflared.log").read())
+        if m:
+            hostname = m.group(1)
+            break
+
+if hostname:
+    auth_line = "" if not PUBKEY.strip() else "    # (key login enabled, add IdentityFile if needed)\n"
+    print("\n✅ TUNNEL IS LIVE! Put this in ~/.ssh/config (replace the old 'Host kaggle' block):\n")
+    print(f"""Host kaggle
+    HostName {hostname}
+    User root
+    ProxyCommand /opt/homebrew/bin/cloudflared access ssh --hostname %h
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+{auth_line}""")
+    print(f"🔒 Password: {PASSWORD}")
+    print("⏳ Keep this cell running. Then in VS Code: Remote-SSH → Connect to Host → kaggle")
+    try:
+        process.wait()
+    except KeyboardInterrupt:
+        process.terminate()
+else:
+    print("❌ Failed to get tunnel URL. Log output:\n")
+    print(open("cloudflared.log").read() if os.path.exists("cloudflared.log") else "(no log file)")
